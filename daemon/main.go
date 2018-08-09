@@ -825,16 +825,16 @@ func runDaemon() {
 	cachesSynced := make(chan struct{})
 
 	go func() {
-		log.Info("Waiting until all pre-existing policies have been received")
+		log.Info("Waiting until all pre-existing policies and services have been received")
 		d.k8sResourceSyncWaitGroup.Wait()
 		cachesSynced <- struct{}{}
 	}()
 
 	select {
 	case <-cachesSynced:
-		log.Info("All pre-existing policies have been received; continuing")
+		log.Info("All pre-existing policies and services have been received; continuing")
 	case <-time.After(cacheSyncTimeout):
-		log.Fatalf("Timed out waiting for pre-existing policies to be received; exiting")
+		log.Fatalf("Timed out waiting for pre-existing policies and services to be received; exiting")
 	}
 
 	if option.Config.RestoreState {
@@ -843,6 +843,21 @@ func runDaemon() {
 		// is bootstrapped.
 		d.regenerateRestoredEndpoints(restoredEndpoints)
 		go func() {
+			if k8s.IsEnabled() {
+				log.Debugf("waiting for all services to be listed by Kubernetes before syncing loadbalancer maps")
+				log.Debugf("done waiting for all services to be listed by Kubernetes before syncing loadbalancer maps")
+
+				// Start controller which removes any leftover Kubernetes services
+				// that may have been deleted while Cilium was not running.
+				controller.NewManager().UpdateController("sync-lb-maps-with-k8s-services",
+					controller.ControllerParams{
+						DoFunc: func() error {
+							return d.syncLBMapsWithK8s()
+						},
+					},
+				)
+				return
+			}
 			if err := d.SyncLBMap(); err != nil {
 				log.WithError(err).Warn("Error while recovering endpoints")
 			}

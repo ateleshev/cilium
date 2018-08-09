@@ -389,6 +389,17 @@ func (d *Daemon) RevNATDelete(id loadbalancer.ServiceID) error {
 	return err
 }
 
+func (d *Daemon) deleteRevNATBPFLocked(id loadbalancer.ServiceID, isIPv4 bool) error {
+	var revNATK lbmap.RevNatKey
+	if isIPv4 {
+		revNATK = lbmap.NewRevNat4Key(uint16(id))
+	} else {
+		revNATK = lbmap.NewRevNat6Key(uint16(id))
+	}
+	err := lbmap.DeleteRevNat(revNATK)
+	return err
+}
+
 // RevNATDeleteAll deletes all RevNAT4, if IPv4 is enabled on daemon, and all RevNAT6
 // stored on the daemon and on the bpf maps.
 //
@@ -438,6 +449,91 @@ func (d *Daemon) RevNATDump() ([]loadbalancer.L3n4AddrID, error) {
 	return dump, nil
 }
 
+func dumpBPFServiceMapsToUserspace() (loadbalancer.SVCMap, []*loadbalancer.LBSVC, []error) {
+
+	newSVCMap := loadbalancer.SVCMap{}
+	newSVCList := []*loadbalancer.LBSVC{}
+	errors := make([]error, 0, 2)
+
+	parseSVCEntries := func(key bpf.MapKey, value bpf.MapValue) {
+		svcKey := key.(lbmap.ServiceKey)
+		//It's the frontend service so we don't add this one
+		if svcKey.GetBackend() == 0 {
+			return
+		}
+		svcValue := value.(lbmap.ServiceValue)
+
+		scopedLog := log.WithFields(logrus.Fields{
+			logfields.BPFMapKey:   svcKey,
+			logfields.BPFMapValue: svcValue,
+		})
+
+		scopedLog.Debug("parsing service mapping")
+		fe, be, err := lbmap.ServiceKeynValue2FEnBE(svcKey, svcValue)
+		if err != nil {
+			scopedLog.WithError(err).Error("SyncLBMap.parseSVCEntries")
+			return
+		}
+
+		svc := newSVCMap.AddFEnBE(fe, be, svcKey.GetBackend())
+		newSVCList = append(newSVCList, svc)
+	}
+
+	if !option.Config.IPv4Disabled {
+		err := lbmap.Service4Map.DumpWithCallback(parseSVCEntries)
+		if err != nil {
+			errors = append(errors, err)
+		}
+	}
+
+	err := lbmap.Service6Map.DumpWithCallback(parseSVCEntries)
+	if err != nil {
+		errors = append(errors, err)
+	}
+
+	return newSVCMap, newSVCList, errors
+}
+
+// TODO documentation - assumes mutex is held.?
+func dumpBPFRevNatMapsToUserspace() (loadbalancer.RevNATMap, []error) {
+
+	newRevNATMap := loadbalancer.RevNATMap{}
+	errors := make([]error, 0, 2)
+
+	// TODO cleanup revnat mappings in ref to k8s services??
+	parseRevNATEntries := func(key bpf.MapKey, value bpf.MapValue) {
+		revNatK := key.(lbmap.RevNatKey)
+		revNatV := value.(lbmap.RevNatValue)
+		scopedLog := log.WithFields(logrus.Fields{
+			logfields.BPFMapKey:   revNatK,
+			logfields.BPFMapValue: revNatV,
+		})
+
+		scopedLog.Debug("parsing BPF revNAT mapping")
+		fe, err := lbmap.RevNatValue2L3n4AddrID(revNatK, revNatV)
+		if err != nil {
+			scopedLog.WithError(err).Error("SyncLBMap.parseRevNATEntries")
+			return
+		}
+		newRevNATMap[fe.ID] = fe.L3n4Addr
+	}
+
+	if !option.Config.IPv4Disabled {
+		if err := lbmap.RevNat4Map.DumpWithCallback(parseRevNATEntries); err != nil {
+			err = fmt.Errorf("error dumping RevNat5Map: %s", err)
+			errors = append(errors, err)
+		}
+	}
+
+	if err := lbmap.RevNat6Map.DumpWithCallback(parseRevNATEntries); err != nil {
+		err = fmt.Errorf("error dumping RevNat6Map: %s", err)
+		errors = append(errors, err)
+	}
+
+	return newRevNATMap, errors
+
+}
+
 // SyncLBMap syncs the bpf lbmap with the daemon's lb map. All bpf entries will overwrite
 // the daemon's LB map. If the bpf lbmap entry has a different service ID than the
 // KVStore's ID, that entry will be updated on the bpf map accordingly with the new ID
@@ -449,7 +545,9 @@ func (d *Daemon) SyncLBMap() error {
 	}
 
 	log.Info("Syncing BPF LBMaps with daemon's LB maps...")
+
 	d.loadBalancer.BPFMapMU.Lock()
+	log.Debugf("BPFMapMU acquired")
 	defer d.loadBalancer.BPFMapMU.Unlock()
 
 	newSVCMap := loadbalancer.SVCMap{}
@@ -508,71 +606,20 @@ func (d *Daemon) SyncLBMap() error {
 		return nil
 	}
 
-	parseSVCEntries := func(key bpf.MapKey, value bpf.MapValue) {
-		svcKey := key.(lbmap.ServiceKey)
-		//It's the frontend service so we don't add this one
-		if svcKey.GetBackend() == 0 {
-			return
-		}
-		svcValue := value.(lbmap.ServiceValue)
-
-		scopedLog := log.WithFields(logrus.Fields{
-			logfields.BPFMapKey:   svcKey,
-			logfields.BPFMapValue: svcValue,
-		})
-
-		scopedLog.Debug("parsing service mapping")
-		fe, be, err := lbmap.ServiceKeynValue2FEnBE(svcKey, svcValue)
-		if err != nil {
-			scopedLog.WithError(err).Error("SyncLBMap.parseSVCEntries")
-			return
-		}
-
-		svc := newSVCMap.AddFEnBE(fe, be, svcKey.GetBackend())
-		newSVCList = append(newSVCList, svc)
+	newSVCMap, newSVCList, lbmapDumpErrors := dumpBPFServiceMapsToUserspace()
+	for _, err := range lbmapDumpErrors {
+		log.WithError(err).Warn("error dumping BPF map into userspace")
 	}
-
-	parseRevNATEntries := func(key bpf.MapKey, value bpf.MapValue) {
-		revNatK := key.(lbmap.RevNatKey)
-		revNatV := value.(lbmap.RevNatValue)
-		scopedLog := log.WithFields(logrus.Fields{
-			logfields.BPFMapKey:   revNatK,
-			logfields.BPFMapValue: revNatV,
-		})
-
-		scopedLog.Debug("parsing BPF revNAT mapping")
-		fe, err := lbmap.RevNatValue2L3n4AddrID(revNatK, revNatV)
-		if err != nil {
-			scopedLog.WithError(err).Error("SyncLBMap.parseRevNATEntries")
-			return
-		}
-		newRevNATMap[fe.ID] = fe.L3n4Addr
-	}
-
-	if !option.Config.IPv4Disabled {
-		// lbmap.RRSeq4Map is updated as part of Service4Map and does
-		// not need separate dump.
-		if err := lbmap.Service4Map.DumpWithCallback(parseSVCEntries); err != nil {
-			log.WithError(err).Warn("error dumping Service4Map")
-		}
-		if err := lbmap.RevNat4Map.DumpWithCallback(parseRevNATEntries); err != nil {
-			log.WithError(err).Warn("error dumping RevNat4Map")
-		}
-	}
-
-	// lbmap.RRSeq6Map is updated as part of Service6Map and does not need
-	// separate dump.
-	if err := lbmap.Service6Map.DumpWithCallback(parseSVCEntries); err != nil {
-		log.WithError(err).Warn("error dumping Service6Map")
-	}
-	if err := lbmap.RevNat6Map.DumpWithCallback(parseRevNATEntries); err != nil {
-		log.WithError(err).Warn("error dumping RevNat6Map")
+	newRevNATMap, revNATMapDumpErrors := dumpBPFRevNatMapsToUserspace()
+	for _, err := range revNATMapDumpErrors {
+		log.WithError(err).Warn("error dumping BPF map into userspace")
 	}
 
 	// Need to do this outside of parseSVCEntries to avoid deadlock, because we
 	// are modifying the BPF maps, and calling Dump on a Map RLocks the maps.
 	log.Debug("iterating over services read from BPF LB Map and seeing if they have the same ID set in the KV store")
 	for _, svc := range newSVCList {
+
 		kvL3n4AddrID, err := service.RestoreID(svc.FE.L3n4Addr, uint32(svc.FE.ID))
 		if err != nil {
 			log.WithError(err).WithFields(logrus.Fields{

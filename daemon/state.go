@@ -25,6 +25,7 @@ import (
 	identityPkg "github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/ipam"
 	"github.com/cilium/cilium/pkg/labels"
+	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/ctmap"
 	"github.com/cilium/cilium/pkg/option"
@@ -319,4 +320,120 @@ func readEPsFromDirNames(basePath string, eptsDirNames []string) []*endpoint.End
 		possibleEPs = append(possibleEPs, ep)
 	}
 	return possibleEPs
+}
+
+func (d *Daemon) syncLBMapsWithK8s() error {
+	k8sServiceIDs := make(map[loadbalancer.ServiceID]struct{})
+	k8sDeletedServices := []loadbalancer.LBSVC{}
+	// maps service IDs to whether they are IPv4 or IPv6
+	k8sDeletedRevNATS := make(map[loadbalancer.ServiceID]bool)
+
+	// Make sure we can't update the K8s service lock
+	// or the BPF maps while we are iterating over each
+	// to avoid having one updated before the other
+	// in parallel, resulting in inadvertent deletions
+	// of services from the BPF maps
+	d.loadBalancer.K8sMU.Lock()
+	log.Debugf("acquire K8sMU controller")
+	defer d.loadBalancer.K8sMU.Unlock()
+
+	d.loadBalancer.BPFMapMU.Lock()
+	log.Debugf("acquire BPFMapMU controller")
+	defer d.loadBalancer.BPFMapMU.Unlock()
+
+	log.Debugf("syncing BPF loadbalancer map with in-memory Kubernetes service map")
+
+	// Get all Cilium Service IDs from Kubernetes Services;
+	// these IDs are the keys for the BPF map which we need
+	// to make comparisons against to see if we need
+	// to delete entries from the BPF maps.
+	for _, k8sServiceInfo := range d.loadBalancer.K8sServices {
+		for _, frontendPort := range k8sServiceInfo.Ports {
+			k8sServiceIDs[frontendPort.ID] = struct{}{}
+			log.WithField(logfields.ServiceID, frontendPort.ID).Debug("adding service to set of services to check against loadbalancer map BPF contents")
+		}
+	}
+
+	log.Debugf("dumping BPF loadbalancer maps to userspace")
+	_, newSVCList, lbmapDumpErrors := dumpBPFServiceMapsToUserspace()
+	if len(lbmapDumpErrors) > 0 {
+		errorStrings := ""
+		for _, err := range lbmapDumpErrors {
+			errorStrings = fmt.Sprintf("%s, %s", err, errorStrings)
+		}
+		return fmt.Errorf("error(s): %s", errorStrings)
+	}
+
+	newRevNATMap, revNATMapDumpErrors := dumpBPFRevNatMapsToUserspace()
+	if len(revNATMapDumpErrors) > 0 {
+		errorStrings := ""
+		for _, err := range revNATMapDumpErrors {
+			errorStrings = fmt.Sprintf("%s, %s", err, errorStrings)
+		}
+		return fmt.Errorf("error(s): %s", errorStrings)
+	}
+
+	for _, svc := range newSVCList {
+
+		// If Kubernetes is enabled, the the list of services managed by it are
+		// the only services that Cilium will allow to be plumbed into the
+		// datapath. Any other loadbalancer map entry which does not exist in
+		// the set of services Cilium manages for Kubernetes will be removed
+		// from the loadbalancer maps. This handles the case where Cilium
+		// is not running, and a service is deleted from Kubernetes which is
+		// managed by Cilium. Because Cilium is not running, the BPF map entry
+		// for said service will not be deleted when the delete call is made
+		// to Kubernetes. Once Cilium starts up again,
+		// it needs to account for this case and clean up any services it
+		// didn't have a chance to clean up because it was not running.
+		if _, ok := k8sServiceIDs[svc.FE.ID]; !ok {
+			log.WithFields(logrus.Fields{
+				logfields.ServiceID: svc.FE.ID,
+				logfields.L3n4Addr:  logfields.Repr(svc.FE.L3n4Addr)}).Debug("service ID read from BPF maps is not managed by K8s; will delete it from BPF maps")
+			k8sDeletedServices = append(k8sDeletedServices, *svc)
+		}
+	}
+
+	for serviceID, serviceInfo := range newRevNATMap {
+		if _, ok := d.loadBalancer.RevNATMap[serviceID]; !ok {
+			log.WithFields(logrus.Fields{
+				logfields.ServiceID: serviceID,
+				logfields.L3n4Addr:  logfields.Repr(serviceInfo)}).Debug("revNAT ID read from BPF maps is not managed by K8s; will delete it from BPF maps")
+			// If IPv6
+			if serviceInfo.IP.To4() == nil {
+				k8sDeletedRevNATS[serviceID] = false
+			} else {
+				k8sDeletedRevNATS[serviceID] = true
+			}
+		}
+	}
+
+	bpfDeleteErrors := make([]error, 0, len(k8sDeletedServices))
+
+	for _, svc := range k8sDeletedServices {
+		svcLogger := log.WithField(logfields.Object, logfields.Repr(svc.FE))
+		svcLogger.Debug("removing service because it was not synced from Kubernetes")
+		if err := d.svcDeleteBPF(&svc); err != nil {
+			bpfDeleteErrors = append(bpfDeleteErrors, err)
+		}
+	}
+
+	for serviceID, isIPv4 := range k8sDeletedRevNATS {
+		log.WithFields(logrus.Fields{logfields.ServiceID: serviceID, "isIPv4": isIPv4}).Debug("removing revNAT because it was not synced from Kubernetes")
+		if err := d.deleteRevNATBPFLocked(serviceID, isIPv4); err != nil {
+			bpfDeleteErrors = append(bpfDeleteErrors, err)
+		}
+	}
+
+	if len(bpfDeleteErrors) > 0 {
+		bpfErrorsString := ""
+		for _, err := range bpfDeleteErrors {
+			bpfErrorsString = fmt.Sprintf("%s, %s", err, bpfErrorsString)
+		}
+		return fmt.Errorf("Errors deleting BPF map entries: %s", bpfErrorsString)
+	}
+
+	log.Debugf("successfully synced BPF loadbalancer and revNAT maps with in-memory Kubernetes service maps")
+
+	return nil
 }
